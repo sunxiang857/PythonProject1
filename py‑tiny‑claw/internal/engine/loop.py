@@ -1,22 +1,41 @@
+import logging
 from typing import List
 from internal.provider.interface import LLMProvider
 from internal.tools.registry import Registry
 from internal.schema.message import Message, ROLE_SYSTEM, ROLE_USER
 
+log = logging.getLogger(__name__)
+
 
 class AgentEngine:
-    """ReAct真正心脏：MainLoop引擎，只依赖抽象接口，不绑定具体实现"""
-    def __init__(self, provider: LLMProvider, registry: Registry, work_dir: str):
+    """Agent引擎：Two-Stage ReAct 两阶段慢思考循环
+
+    把上一讲「一次请求带 tools 跑完思考与行动」的基础 Main Loop，
+    升级为物理隔离的两阶段循环（机制决定行为）：
+
+    Phase 1 · Thinking（慢思考）：
+        不传 tools（传 None 剥夺工具），模型只能输出纯文本推理与规划，
+        思考 Trace 追加进上下文，利用自回归引导后续行动。
+    Phase 2 · Reason（带工具思考）：
+        恢复 tools 列表，模型基于自己刚写下的规划生成 ToolCall。
+    Phase 3 · Act + Observe：
+        执行工具，把观察结果写回上下文，进入下一轮 Turn。
+    """
+
+    def __init__(self, provider: LLMProvider, registry: Registry, work_dir: str,
+                 enable_thinking: bool = False):
         self.provider = provider
         self.registry = registry
         self.work_dir = work_dir
+        # 慢思考开关：简单任务（如只问天气）可关闭，节省 Token；复杂代码任务则打开
+        self.enable_thinking = enable_thinking
 
     def run(self, user_prompt: str) -> None:
         # ========== 初始化上下文Context ==========
         context_history: List[Message] = [
             Message(
                 role=ROLE_SYSTEM,
-                content="You are py‑tiny‑claw, an expert coding assistant. You have full access to tools in the workspace."
+                content="You are py-tiny-claw, an expert coding assistant. You have full access to tools in the workspace."
             ),
             Message(
                 role=ROLE_USER,
@@ -27,39 +46,59 @@ class AgentEngine:
         turn_count = 0
         while True:
             turn_count += 1
-            print(f"\n===== 🌀 Turn {turn_count} 开始 =====")
+            print(f"\n========== [Turn {turn_count}] 开始 ==========")
 
             # 获取本轮可用工具列表
             available_tools = self.registry.get_available_tools()
 
-            # -------- Step1 Reason 推理阶段：调用Provider获取模型响应 --------
+            # ================= Phase 1: 慢思考 Thinking =================
+            if self.enable_thinking:
+                log.info("[Phase 1] 剥夺工具访问权，强制进入慢思考与规划阶段...")
+                print("[Engine][Phase 1] 剥夺工具访问权，强制进入慢思考...")
+                try:
+                    # 核心魔法：第二个参数传 None，剥夺工具 Schema，
+                    # 模型没有「诱饵」，只能乖乖输出纯文本推理与规划
+                    think_resp = self.provider.generate(context_history, None)
+                except Exception as e:
+                    raise RuntimeError(f"Thinking 阶段失败: {e}") from e
+
+                if think_resp.content != "":
+                    print(f"[内部思考 Trace]: {think_resp.content}")
+                # 把思考 Trace 追加进上下文（自回归：模型会顺着自己的计划行动）
+                context_history.append(think_resp)
+            else:
+                print("[Engine] 慢思考模式: False，跳过 Phase 1 直接行动")
+
+            # ================= Phase 2: Reason 思考（带工具） =================
+            log.info("[Phase 2] 恢复工具挂载，等待模型行动...")
+            print("[Engine][Phase 2] 恢复工具挂载，等待模型行动...")
             try:
-                response_msg = self.provider.generate(context_history, available_tools)
+                action_resp = self.provider.generate(context_history, available_tools)
             except Exception as e:
-                raise RuntimeError(f"模型生成失败: {e}") from e
+                raise RuntimeError(f"Action 阶段失败: {e}") from e
+            context_history.append(action_resp)
 
-            # 将assistant消息追加到上下文记忆
-            context_history.append(response_msg)
-            if response_msg.content:
-                print(f"🧠模型思考：{response_msg.content}")
+            if action_resp.content != "":
+                print(f"[对外回复]: {action_resp.content}")
 
-            # -------- 判断终止条件：没有tool_calls，任务结束 --------
-            tool_calls = response_msg.tool_calls
-            if (tool_calls is None) or (len(tool_calls) == 0):
-                print("\n✅ 无工具调用，ReAct循环终止，最终回答：")
-                print(response_msg.content)
+            # ================= 执行判断 =================
+            if not action_resp.tool_calls:  # None 或空列表都视为任务完成
+                log.info("模型未请求工具，任务完成。")
+                print("\n✅ [Engine] 模型未请求调用工具，任务宣告完成。")
                 return
 
-            # -------- Step2 Act行动阶段：执行全部工具调用 --------
-            for one_call in tool_calls:
-                print(f"🔧 执行工具调用 name={one_call.name}, args={one_call.arguments}")
-                tool_result = self.registry.execute(one_call)
+            print(f"[Engine] 模型请求调用 {len(action_resp.tool_calls)} 个工具...")
 
-                # -------- Step3 Observe观察阶段：把工具结果包装成Message写回Context --------
-                observe_msg = Message(
+            # ================= Phase 3: Act + Observe 行动与观察 =================
+            for tool_call in action_resp.tool_calls:
+                print(f"-> 执行工具: {tool_call.name}, 参数: {tool_call.arguments}")
+                result = self.registry.execute(tool_call)
+
+                # 观察结果包装成 Message 写回 Context，进入下一轮
+                observation_msg = Message(
                     role=ROLE_USER,
-                    content=tool_result.output,
-                    tool_call_id=tool_result.tool_call_id
+                    content=result.output,
+                    tool_call_id=tool_call.id,
                 )
-                context_history.append(observe_msg)
-                print(f"👁️观察(工具返回):\n{tool_result.output}")
+                context_history.append(observation_msg)
+                print(f"-> 工具执行成功 (返回 {len(result.output)} 字节)")
